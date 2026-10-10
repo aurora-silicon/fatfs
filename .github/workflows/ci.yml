@@ -39,6 +39,10 @@ jobs:
         run: cargo test --verbose
         if: ${{ matrix.run_tests }}
 
+      - name: Test explicit FAT32 compatibility
+        run: cargo test --test aurora --features explicit-fat32
+        if: ${{ matrix.run_tests }}
+
       - name: Build - no_std
         run: cargo build --no-default-features
 
@@ -47,3 +51,6 @@ jobs:
 
       - name: Build - no_std, alloc, lfn, unicode
         run: cargo build --no-default-features --features alloc,lfn,unicode
+
+      - name: Build - no_std, alloc, lfn, explicit-fat32
+        run: cargo build --no-default-features --features alloc,lfn,explicit-fat32
