@@ -181,3 +181,67 @@ fn short_reads_and_fragmented_chains_preserve_data_and_seek_position() {
         }
     }
 }
+
+// A FAT16 volume with payload.bin (3 clusters) and sub/inner.txt; returns the image, the byte
+// offsets of the two directory entries and of the FAT, and payload.bin's first cluster.
+fn corruptible_image() -> (Vec<u8>, usize, usize, usize, u16) {
+    let mut image = file_image(&[0xa5; 1536], false);
+    {
+        let disk = StdIoWrapper::new(Cursor::new(&mut image));
+        let fs = FileSystem::new(disk, FsOptions::new()).unwrap();
+        let sub = fs.root_dir().create_dir("sub").unwrap();
+        sub.create_file("inner.txt").unwrap().write_all(b"inner").unwrap();
+    }
+    let find = |name: &[u8; 11]| image.windows(11).position(|w| w == name).unwrap();
+    let payload = find(b"PAYLOAD BIN");
+    let sub = find(b"SUB        ");
+    let fat = usize::from(u16::from_le_bytes([image[14], image[15]])) * 512;
+    let first = u16::from_le_bytes([image[payload + 26], image[payload + 27]]);
+    (image, payload, sub, fat, first)
+}
+
+// Cluster numbers from directory entries and the FAT that name no data cluster (0 and 1 are
+// reserved, the rest past the volume's last cluster) make reads fail; nothing panics.
+#[test]
+fn invalid_cluster_numbers_are_corruption() {
+    let (_, _, _, _, first) = corruptible_image();
+    let past_end = 0xfff0; // below the FAT16 bad-cluster and end-of-chain markers
+    let cases: Vec<(&str, Box<dyn Fn(&mut Vec<u8>, usize, usize, usize)>)> = vec![
+        ("file starts at cluster 1", Box::new(|im, p, _, _| put16(im, p + 26, 1))),
+        (
+            "file starts past the volume",
+            Box::new(move |im, p, _, _| put16(im, p + 26, past_end)),
+        ),
+        (
+            "FAT links to cluster 1",
+            Box::new(move |im, _, _, fat| put16(im, fat + 2 * usize::from(first), 1)),
+        ),
+        (
+            "FAT links past the volume",
+            Box::new(move |im, _, _, fat| put16(im, fat + 2 * usize::from(first), past_end)),
+        ),
+    ];
+    for (what, corrupt) in &cases {
+        let (mut image, payload, sub, fat, _) = corruptible_image();
+        corrupt(&mut image, payload, sub, fat);
+        let fs = FileSystem::new(Cursor::new(image), FsOptions::new()).unwrap();
+        let mut file = fs.root_dir().open_file("payload.bin").unwrap();
+        let mut content = Vec::new();
+        let err = file.read_to_end(&mut content).expect_err(what);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{what}");
+        let mut file = fs.root_dir().open_file("payload.bin").unwrap();
+        assert!(file.extents().any(|e| e.is_err()), "{what}: extents");
+        let mut file = fs.root_dir().open_file("payload.bin").unwrap();
+        assert!(
+            file.seek(SeekFrom::Start(1000)).is_err() || file.read(&mut [0; 1]).is_err(),
+            "{what}: seek"
+        );
+    }
+    for cluster in [1, past_end] {
+        let (mut image, _, sub, _, _) = corruptible_image();
+        put16(&mut image, sub + 26, cluster);
+        let fs = FileSystem::new(Cursor::new(image), FsOptions::new()).unwrap();
+        let dir = fs.root_dir().open_dir("sub").unwrap();
+        assert!(dir.iter().any(|e| e.is_err()), "directory at cluster {cluster}");
+    }
+}

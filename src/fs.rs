@@ -455,12 +455,29 @@ impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
         self.first_data_sector + self.bpb.sectors_from_clusters(cluster - RESERVED_FAT_ENTRIES)
     }
 
+    /// One past the highest data cluster number.
+    pub(crate) fn end_cluster(&self) -> u32 {
+        self.total_clusters + RESERVED_FAT_ENTRIES
+    }
+
+    /// `cluster` if it names a data cluster of this volume. Cluster numbers come from directory
+    /// entries and the FAT, so a corrupted volume can hold any value there.
+    pub(crate) fn check_cluster(&self, cluster: u32) -> Result<u32, Error<IO::Error>> {
+        if (RESERVED_FAT_ENTRIES..self.end_cluster()).contains(&cluster) {
+            Ok(cluster)
+        } else {
+            error!("invalid cluster number {}", cluster);
+            Err(Error::CorruptedFileSystem)
+        }
+    }
+
     pub fn cluster_size(&self) -> u32 {
         self.bpb.cluster_size()
     }
 
-    pub(crate) fn offset_from_cluster(&self, cluster: u32) -> u64 {
-        self.offset_from_sector(self.sector_from_cluster(cluster))
+    pub(crate) fn offset_from_cluster(&self, cluster: u32) -> Result<u64, Error<IO::Error>> {
+        let cluster = self.check_cluster(cluster)?;
+        Ok(self.offset_from_sector(self.sector_from_cluster(cluster)))
     }
 
     pub(crate) fn bytes_from_clusters(&self, clusters: u32) -> u64 {
@@ -481,7 +498,7 @@ impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
         cluster: u32,
     ) -> ClusterIterator<impl ReadWriteSeek<Error = Error<IO::Error>> + '_, IO::Error> {
         let disk_slice = self.fat_slice();
-        ClusterIterator::new(disk_slice, self.fat_type, cluster)
+        ClusterIterator::new(disk_slice, self.fat_type, cluster, self.end_cluster())
     }
 
     pub(crate) fn truncate_cluster_chain(&self, cluster: u32) -> Result<(), Error<IO::Error>> {
@@ -509,7 +526,7 @@ impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
         };
         if zero {
             let mut disk = self.disk.borrow_mut();
-            disk.seek(SeekFrom::Start(self.offset_from_cluster(cluster)))?;
+            disk.seek(SeekFrom::Start(self.offset_from_cluster(cluster)?))?;
             write_zeros(&mut *disk, u64::from(self.cluster_size()))?;
         }
         let mut fs_info = self.fs_info.borrow_mut();

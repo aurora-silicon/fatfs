@@ -584,6 +584,8 @@ pub(crate) struct ClusterIterator<B, E, S = B> {
     fat: B,
     fat_type: FatType,
     cluster: Option<u32>,
+    /// one past the highest data cluster: the chain must stay in 2..end_cluster
+    end_cluster: u32,
     err: bool,
     // phantom is needed to add type bounds on the storage type
     phantom_s: PhantomData<S>,
@@ -597,11 +599,12 @@ where
     S: Read + Write + Seek,
     Error<E>: From<S::Error>,
 {
-    pub(crate) fn new(fat: B, fat_type: FatType, cluster: u32) -> Self {
+    pub(crate) fn new(fat: B, fat_type: FatType, cluster: u32, end_cluster: u32) -> Self {
         Self {
             fat,
             fat_type,
             cluster: Some(cluster),
+            end_cluster,
             err: false,
             phantom_s: PhantomData,
             phantom_e: PhantomData,
@@ -646,7 +649,20 @@ where
             return None;
         }
         if let Some(current_cluster) = self.cluster {
-            self.cluster = match get_next_cluster(self.fat.borrow_mut(), self.fat_type, current_cluster) {
+            // the chain's start comes from a directory entry and every next cluster from the
+            // FAT: either may name a reserved or nonexistent cluster on a corrupted volume
+            let valid = RESERVED_FAT_ENTRIES..self.end_cluster;
+            let next = if valid.contains(&current_cluster) {
+                get_next_cluster(self.fat.borrow_mut(), self.fat_type, current_cluster)
+            } else {
+                Err(Error::CorruptedFileSystem)
+            };
+            self.cluster = match next {
+                Ok(Some(n)) if !valid.contains(&n) => {
+                    error!("invalid cluster number {} in the FAT", n);
+                    self.err = true;
+                    return Some(Err(Error::CorruptedFileSystem));
+                }
                 Ok(next_cluster) => next_cluster,
                 Err(err) => {
                     self.err = true;
@@ -700,7 +716,7 @@ mod tests {
         assert_eq!(count_free_clusters(&mut cur, fat_type, 0x1E).ok(), Some(3));
         // test reading from iterator
         {
-            let iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9);
+            let iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9, 0x100);
             let actual_cluster_numbers = iter.map(Result::ok).collect::<Vec<_>>();
             let expected_cluster_numbers = [0xA_u32, 0x14_u32, 0x15_u32, 0x16_u32, 0x19_u32, 0x1A_u32]
                 .iter()
@@ -711,7 +727,7 @@ mod tests {
         }
         // test truncating a chain
         {
-            let mut iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9);
+            let mut iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9, 0x100);
             assert_eq!(iter.nth(3).map(Result::ok), Some(Some(0x16)));
             assert!(iter.truncate().is_ok());
         }
@@ -720,7 +736,7 @@ mod tests {
         assert_eq!(read_fat(&mut cur, fat_type, 0x1A).ok(), Some(FatValue::Free));
         // test freeing a chain
         {
-            let mut iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9);
+            let mut iter = ClusterIterator::<&mut S, S::Error, S>::new(&mut cur, fat_type, 0x9, 0x100);
             assert!(iter.free().is_ok());
         }
         assert_eq!(read_fat(&mut cur, fat_type, 0x9).ok(), Some(FatValue::Free));

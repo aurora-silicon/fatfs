@@ -101,16 +101,11 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
         Some(
             core::iter::once(Ok(first))
                 .chain(fs.cluster_iter(first))
-                .map(move |cluster_err| match cluster_err {
-                    Ok(cluster) => {
-                        let size = cluster_size.min(bytes_left);
-                        bytes_left -= size;
-                        Ok(Extent {
-                            offset: fs.offset_from_cluster(cluster),
-                            size,
-                        })
-                    }
-                    Err(e) => Err(e),
+                .map(move |cluster_err| {
+                    let offset = fs.offset_from_cluster(cluster_err?)?;
+                    let size = cluster_size.min(bytes_left);
+                    bytes_left -= size;
+                    Ok(Extent { offset, size })
                 }),
         )
         .into_iter()
@@ -131,7 +126,8 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
                 } else {
                     offset_mod_cluster_size
                 };
-                let offset_in_fs = self.fs.offset_from_cluster(n) + u64::from(offset_in_cluster);
+                // n was read or written through, so it is a valid cluster
+                let offset_in_fs = self.fs.offset_from_cluster(n).ok()? + u64::from(offset_in_cluster);
                 Some(offset_in_fs)
             }
             None => None,
@@ -304,7 +300,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
             }
         }
         trace!("read {} bytes in cluster {}", read_size, current_cluster);
-        let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
+        let offset_in_fs = self.fs.offset_from_cluster(current_cluster)? + u64::from(offset_in_cluster);
         let read_bytes = {
             let mut disk = self.fs.disk.borrow_mut();
             disk.seek(SeekFrom::Start(offset_in_fs))?;
@@ -384,7 +380,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
             }
         };
         trace!("write {} bytes in cluster {}", write_size, current_cluster);
-        let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
+        let offset_in_fs = self.fs.offset_from_cluster(current_cluster)? + u64::from(offset_in_cluster);
         let written_bytes = {
             let mut disk = self.fs.disk.borrow_mut();
             disk.seek(SeekFrom::Start(offset_in_fs))?;
