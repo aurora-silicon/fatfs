@@ -611,10 +611,25 @@ where
         }
     }
 
+    // The cluster about to be rewritten must be a data cluster of this volume, and the move to
+    // the next one must have read a valid link: a corrupted chain ends with an error here.
+    fn step(&mut self, n: u32) -> Result<(), Error<E>> {
+        if !(RESERVED_FAT_ENTRIES..self.end_cluster).contains(&n) {
+            error!("invalid cluster number {} in a cluster chain", n);
+            self.cluster = None;
+            self.err = true;
+            return Err(Error::CorruptedFileSystem);
+        }
+        match self.next() {
+            Some(Err(err)) => Err(err),
+            _ => Ok(()),
+        }
+    }
+
     pub(crate) fn truncate(&mut self) -> Result<u32, Error<E>> {
         if let Some(n) = self.cluster {
             // Move to the next cluster
-            self.next();
+            self.step(n)?;
             // Mark previous cluster as end of chain
             write_fat(self.fat.borrow_mut(), self.fat_type, n, FatValue::EndOfChain)?;
             // Free rest of chain
@@ -627,7 +642,7 @@ where
     pub(crate) fn free(&mut self) -> Result<u32, Error<E>> {
         let mut num_free = 0;
         while let Some(n) = self.cluster {
-            self.next();
+            self.step(n)?;
             write_fat(self.fat.borrow_mut(), self.fat_type, n, FatValue::Free)?;
             num_free += 1;
         }
@@ -660,11 +675,13 @@ where
             self.cluster = match next {
                 Ok(Some(n)) if !valid.contains(&n) => {
                     error!("invalid cluster number {} in the FAT", n);
+                    self.cluster = None;
                     self.err = true;
                     return Some(Err(Error::CorruptedFileSystem));
                 }
                 Ok(next_cluster) => next_cluster,
                 Err(err) => {
+                    self.cluster = None;
                     self.err = true;
                     return Some(Err(err));
                 }

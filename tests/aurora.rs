@@ -245,3 +245,55 @@ fn invalid_cluster_numbers_are_corruption() {
         assert!(dir.iter().any(|e| e.is_err()), "directory at cluster {cluster}");
     }
 }
+
+// Removing or truncating a file whose chain names a reserved or nonexistent cluster fails as
+// corruption: it ends, and it writes no FAT entry outside the volume's data clusters.
+#[test]
+fn invalid_cluster_chains_are_not_freed_or_truncated() {
+    let (_, _, _, _, first) = corruptible_image();
+    let past_end = 0xfff0;
+    let cases: Vec<(&str, Box<dyn Fn(&mut Vec<u8>, usize, usize)>)> = vec![
+        ("file starts at cluster 1", Box::new(|im, p, _| put16(im, p + 26, 1))),
+        (
+            "file starts past the volume",
+            Box::new(move |im, p, _| put16(im, p + 26, past_end)),
+        ),
+        (
+            "FAT links to cluster 1",
+            Box::new(move |im, _, fat| put16(im, fat + 2 * usize::from(first), 1)),
+        ),
+        (
+            "FAT links past the volume",
+            Box::new(move |im, _, fat| put16(im, fat + 2 * usize::from(first), past_end)),
+        ),
+    ];
+    for remove in [true, false] {
+        for (what, corrupt) in &cases {
+            let (mut image, payload, _, fat, _) = corruptible_image();
+            corrupt(&mut image, payload, fat);
+            let reserved = image[fat..fat + 4].to_vec();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut cur = Cursor::new(image);
+                let result = {
+                    let fs = FileSystem::new(&mut cur, FsOptions::new()).unwrap();
+                    if remove {
+                        fs.root_dir().remove("payload.bin").map(|_| ())
+                    } else {
+                        let mut file = fs.root_dir().open_file("payload.bin").unwrap();
+                        file.seek(SeekFrom::Start(0)).unwrap();
+                        file.truncate().map(|_| ())
+                    }
+                };
+                let image = cur.into_inner();
+                tx.send((result.is_err(), image[fat..fat + 4].to_vec())).unwrap();
+            });
+            let op = if remove { "remove" } else { "truncate" };
+            let (failed, after) = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{what}: {op} did not finish"));
+            assert!(failed, "{what}: {op} succeeded");
+            assert_eq!(after, reserved, "{what}: {op} wrote a reserved FAT entry");
+        }
+    }
+}
